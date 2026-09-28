@@ -1,0 +1,142 @@
+name: Build Windows 8 x86 client
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLVM_VERSION: "15.0.6"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VERSION: "1.5.0-secure-tcp-bypass"
+  RUSTFLAGS: "-C link-arg=/SUBSYSTEM:WINDOWS,6.02"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build-windows8-x86:
+    name: Windows 8 x86 (Sciter)
+    runs-on: windows-2022
+
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          submodules: recursive
+
+      - name: Install 32-bit LLVM and Clang
+        uses: rustdesk-org/install-llvm-action-32bit@6aa7d9ad3df84dff01cd4596dd0fc880a7f47fce
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install 32-bit Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install nightly-2023-10-13-i686-pc-windows-msvc \
+            --target i686-pc-windows-msvc --component rustfmt \
+            --profile minimal --no-self-update --force-non-host
+          rustup default nightly-2023-10-13-i686-pc-windows-msvc --force-non-host
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          prefix-key: windows-2022-win8-x86-sciter
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install x86 dependencies
+        shell: bash
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x86-windows-static
+        run: |
+          if ! "$VCPKG_ROOT/vcpkg" install \
+            --triplet x86-windows-static \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "$VCPKG_ROOT/" -name "*.log" -print -exec cat {} \;
+            exit 1
+          fi
+
+      - name: Build Windows 8 x86 client
+        shell: bash
+        run: |
+          python3 res/inline-sciter.py
+          sed -i 's/branch = "dyn"/branch = "dyn_x86"/g' Cargo.toml
+          cargo update -p sciter-rs --precise 674e07d3066ca9a92ced3816203ab6b652629d1e
+          cargo build --locked --features inline,vram,hwcodec --release --bins
+
+          mkdir -p Release
+          mv target/release/rustdesk.exe Release/rustdesk.exe
+          curl --fail --location \
+            --output Release/sciter.dll \
+            https://github.com/c-smile/sciter-sdk/raw/master/bin.win/x32/sciter.dll
+
+          curl --fail --location \
+            --output usbmmidd_v2.zip \
+            https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip
+          unzip -q usbmmidd_v2.zip
+          rm -f usbmmidd_v2/deviceinstaller.exe usbmmidd_v2/usbmmidd.bat
+          mv usbmmidd_v2 Release/
+
+      - name: Verify x86 and Windows 8 PE headers
+        shell: pwsh
+        run: |
+          $headers = llvm-readobj.exe --file-headers .\Release\rustdesk.exe | Out-String
+          Write-Host $headers
+          if ($headers -notmatch 'IMAGE_FILE_MACHINE_I386') {
+            throw 'rustdesk.exe is not a 32-bit x86 executable.'
+          }
+          if ($headers -notmatch 'MajorSubsystemVersion: 6' -or
+              $headers -notmatch 'MinorSubsystemVersion: 2') {
+            throw 'rustdesk.exe does not declare Windows 8 (6.2) as its subsystem version.'
+          }
+
+      - name: Build portable executable
+        shell: bash
+        run: |
+          sed -i '/dpiAware/d' res/manifest.xml
+          pushd libs/portable
+          pip3 install -r requirements.txt
+          python3 generate.py -f ../../Release/ -o . -e ../../Release/rustdesk.exe
+          popd
+
+          mkdir -p dist
+          mv target/release/rustdesk-portable-packer.exe \
+            "dist/rustdesk-${VERSION}-windows8-x86.exe"
+          cp -r Release "dist/rustdesk-${VERSION}-windows8-x86-files"
+
+      - name: Verify portable executable and create checksums
+        shell: pwsh
+        run: |
+          $portable = Get-ChildItem .\dist\rustdesk-*-windows8-x86.exe | Select-Object -First 1
+          $headers = llvm-readobj.exe --file-headers $portable.FullName | Out-String
+          Write-Host $headers
+          if ($headers -notmatch 'IMAGE_FILE_MACHINE_I386') {
+            throw 'The portable client is not a 32-bit x86 executable.'
+          }
+          if ($headers -notmatch 'MajorSubsystemVersion: 6' -or
+              $headers -notmatch 'MinorSubsystemVersion: 2') {
+            throw 'The portable client does not declare Windows 8 (6.2) as its subsystem version.'
+          }
+          Get-ChildItem .\dist -File |
+            Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), (Split-Path $_.Path -Leaf) } |
+            Set-Content .\dist\SHA256SUMS.txt
+
+      - name: Upload Windows 8 x86 client
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rustdesk-${{ env.VERSION }}-windows8-x86
+          path: dist/
+          if-no-files-found: error
