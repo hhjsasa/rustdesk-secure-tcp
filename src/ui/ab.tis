@@ -643,26 +643,66 @@ function handleAbError(err) {
     app.update();
 }
 
+function applyAbResponse(data) {
+    if (data && data.error) {
+        handleAbError(data.error);
+        return;
+    }
+    var next = { tags: [], peers: [] };
+    if (data && data.data) {
+        next = typeof data.data == "string" ? JSON.parse(data.data) : data.data;
+    } else if (data && (data.tags || data.peers)) {
+        next = data;
+    }
+    if (!next) next = { tags: [], peers: [] };
+    if (!next.tags) next.tags = [];
+    if (!next.peers) next.peers = [];
+    ab = next;
+    abLoading = false;
+    app.update();
+}
+
+function getRequest(url, _onSuccess, _onError) {
+    var headers = JSON.stringify({
+        "Authorization": "Bearer " + handler.get_local_option("access_token"),
+        "Content-Type": "application/json"
+    });
+    handler.get_request(url, headers);
+    function check_status() {
+        var status = handler.get_request_status(url);
+        if (status == " ") {
+            self.timer(0.1s, check_status);
+            return;
+        }
+        try {
+            var response = JSON.parse(status || "{}");
+            var statusCode = response.status_code || 0;
+            if (statusCode < 200 || statusCode >= 300) {
+                _onError(response.body || "HTTP " + statusCode, statusCode);
+                return;
+            }
+            _onSuccess(JSON.parse(response.body || "{}"));
+        } catch (e) {
+            _onError(status, 0);
+        }
+    }
+    check_status();
+}
+
 function getAb() {
     abLoading = true;
     abError = "";
     app.update();
-    httpRequest(handler.get_api_server() + "/api/ab/get", #post, {}, function(data) {
-        if (data) {
-            if (data.error) {
-                handleAbError(data.error);
-                return;
-            }
-            var tm = data.updated_at;
-            ab = JSON.parse(data.data);
-            if (!ab.tags) ab.tags = [];
-            if (!ab.peers) ab.peers = [];
-        }
-        abLoading = false;
-        app.update();
+    var api = handler.get_api_server();
+    getRequest(api + "/api/ab", function(data) {
+        applyAbResponse(data);
     }, function(err, status) {
-        handleAbError(err);
-    }, getHttpHeaders());
+        httpRequest(api + "/api/ab/get", #post, {}, function(data) {
+            applyAbResponse(data);
+        }, function(legacyErr, legacyStatus) {
+            handleAbError(legacyErr);
+        }, getHttpHeaders());
+    });
 }
 
 function updateAb() {
@@ -769,4 +809,3 @@ function editRdpPort() {
         }
       }, 240);
 }
-
