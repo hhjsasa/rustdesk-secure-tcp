@@ -1,0 +1,417 @@
+name: Build AppImage, Android and Debian ARM64 clients
+
+on:
+  workflow_dispatch:
+    inputs:
+      linux_source_run_id:
+        description: Run ID containing the Linux DEB artifact
+        required: true
+        default: "36365619249"
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  RUST_VERSION: "1.75"
+  FLUTTER_VERSION: "3.24.5"
+  CARGO_NDK_VERSION: "3.1.2"
+  NDK_VERSION: "r28c"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  VCPKG_CMAKE_VERSION: "4.3.0"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VERSION: "1.5.0-secure-tcp-bypass"
+
+jobs:
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  build-appimage:
+    name: Build Linux x86_64 AppImage
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          submodules: recursive
+
+      - name: Download previously built Linux DEB
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: rustdesk-${{ env.VERSION }}-linux-x86_64
+          path: linux-artifact
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.linux_source_run_id }}
+
+      - name: Build AppImage
+        shell: bash
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y libarchive-tools libfuse2
+          sudo pip3 install "setuptools_scm<10"
+          sudo pip3 install git+https://github.com/rustdesk-org/appimage-builder.git
+          cp "linux-artifact/rustdesk-${VERSION}-x86_64.deb" appimage/rustdesk.deb
+          pushd appimage
+          ./build-apprun.sh x86_64
+          sudo appimage-builder --skip-tests --recipe ./AppImageBuilder-x86_64.yml
+          cmp AppDir/AppRun appimage-build/AppRun/v2.0.0/AppRun-Release-x86_64
+          popd
+          mkdir -p dist
+          appimage_path=$(find appimage -maxdepth 1 -type f -name '*.AppImage' -print -quit)
+          test -n "$appimage_path"
+          mv "$appimage_path" "dist/rustdesk-${VERSION}-x86_64.AppImage"
+          chmod +x "dist/rustdesk-${VERSION}-x86_64.AppImage"
+          sha256sum "dist/rustdesk-${VERSION}-x86_64.AppImage" > dist/SHA256SUMS-appimage.txt
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rustdesk-${{ env.VERSION }}-linux-x86_64-appimage
+          path: dist/
+          if-no-files-found: error
+
+  build-debian-arm64:
+    name: Build Debian ARM64 client
+    needs: generate-bridge
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Prepare runner
+        run: |
+          sudo rm -rf /opt/ghc /usr/local/lib/android /usr/share/dotnet
+          sudo apt-get update -y
+          sudo apt-get install -y nasm libva-dev
+
+      - name: Checkout source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          submodules: recursive
+
+      - name: Set swap
+        uses: pierotofy/set-swap-space@49819abfb41bd9b44fb781159c033dba90353a7c
+        with:
+          swap-size-gb: 12
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-unknown-linux-gnu
+          components: rustfmt
+
+      - name: Save Rust version and limit library output
+        shell: bash
+        run: |
+          cargo_version=$(cargo --version | awk '{print $2}')
+          echo "RUST_TOOLCHAIN_VERSION=$cargo_version" >> "$GITHUB_ENV"
+          sed -i 's/\["cdylib", "staticlib", "rlib"\]/["cdylib"]/g' Cargo.toml
+
+      - name: Restore generated bridge
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install CMake required by vcpkg
+        shell: bash
+        run: |
+          python3 -m pip install --user "cmake==${VCPKG_CMAKE_VERSION}"
+          user_base=$(python3 -m site --user-base)
+          "$user_base/bin/cmake" --version
+          echo "$user_base/bin" >> "$GITHUB_PATH"
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install ARM64 native dependencies
+        shell: bash
+        run: |
+          if ! "$VCPKG_ROOT/vcpkg" install --triplet arm64-linux --x-install-root="$VCPKG_ROOT/installed"; then
+            find "$VCPKG_ROOT" -name '*.log' -print -exec cat {} \;
+            exit 1
+          fi
+
+      - name: Build Debian ARM64 package
+        uses: rustdesk-org/run-on-arch-action@d3fcfbb632b84cf7f6bc772bfaaa2c2f4f8789a8
+        with:
+          arch: aarch64
+          distro: ubuntu18.04
+          githubToken: ${{ github.token }}
+          dockerRunArgs: |
+            --volume "${{ github.workspace }}:/workspace"
+            --volume "/opt/artifacts:/opt/artifacts"
+          shell: /bin/bash
+          install: |
+            apt-get update -y
+            apt-get install -y \
+              build-essential clang cmake curl gcc git g++ \
+              libayatana-appindicator3-dev libasound2-dev libclang-10-dev \
+              libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgtk-3-dev \
+              libpulse-dev libva-dev libxcb-randr0-dev libxcb-shape0-dev \
+              libxcb-xfixes0-dev libxdo-dev libxfixes-dev llvm-10-dev nasm \
+              ninja-build pkg-config python3 unzip wget xz-utils libssl-dev
+            apt-get remove -y libopus-dev || true
+          run: |
+            git config --global --add safe.directory '*'
+            cd /opt
+            wget -q -O rust.tar.gz "https://static.rust-lang.org/dist/rust-${{ env.RUST_TOOLCHAIN_VERSION }}-aarch64-unknown-linux-gnu.tar.gz"
+            tar -xzf rust.tar.gz
+            rm rust.tar.gz
+            cd "rust-${{ env.RUST_TOOLCHAIN_VERSION }}-aarch64-unknown-linux-gnu"
+            ./install.sh
+
+            cd /workspace
+            export VCPKG_ROOT=/opt/artifacts/vcpkg
+            export CARGO_INCREMENTAL=0
+            cargo build --locked --lib --jobs 3 --features hwcodec,flutter,unix-file-copy-paste --release
+            rm -rf target/release/deps target/release/build
+
+            cd /opt
+            wget -q "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz"
+            tar -xf "flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz"
+            git clone https://github.com/sony/flutter-elinux.git
+            cd flutter-elinux
+            git reset --hard "${{ env.FLUTTER_VERSION }}"
+            bin/flutter-elinux doctor -v
+            bin/flutter-elinux precache --linux
+            cp -R /opt/flutter/bin/cache/artifacts/engine/linux-x64/shader_lib flutter/bin/cache/artifacts/engine/linux-arm64
+            cd flutter
+            git apply /workspace/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+            cd /workspace
+            sed -i 's/flutter build linux --release/flutter-elinux build linux --verbose/g' build.py
+            sed -i 's/x64\/release/arm64\/release/g' build.py
+            export PATH=/opt/flutter-elinux/bin:$PATH
+            export DEB_ARCH=arm64
+            python3 ./build.py --flutter --skip-cargo
+            mv rustdesk-1.5.0.deb "rustdesk-${{ env.VERSION }}-arm64.deb"
+            sha256sum "rustdesk-${{ env.VERSION }}-arm64.deb" > SHA256SUMS-debian-arm64.txt
+
+      - name: Inspect Debian ARM64 package
+        shell: bash
+        run: |
+          file "rustdesk-${VERSION}-arm64.deb"
+          dpkg-deb --info "rustdesk-${VERSION}-arm64.deb" | head -n 30
+
+      - name: Upload Debian ARM64 client
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rustdesk-${{ env.VERSION }}-debian-arm64
+          path: |
+            rustdesk-${{ env.VERSION }}-arm64.deb
+            SHA256SUMS-debian-arm64.txt
+          if-no-files-found: error
+
+  build-android-libraries:
+    name: Build Android native library (${{ matrix.target }})
+    needs: generate-bridge
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            abi: arm64-v8a
+            cxx_triple: aarch64-linux-android
+            build_script: ndk_arm64.sh
+          - target: armv7-linux-androideabi
+            abi: armeabi-v7a
+            cxx_triple: arm-linux-androideabi
+            build_script: ndk_arm.sh
+          - target: x86_64-linux-android
+            abi: x86_64
+            cxx_triple: x86_64-linux-android
+            build_script: ndk_x64.sh
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang cmake curl gcc-multilib git g++ g++-multilib \
+            libayatana-appindicator3-dev libasound2-dev libc6-dev libclang-dev \
+            libunwind-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgtk-3-dev libpulse-dev libva-dev libxcb-randr0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxdo-dev libxfixes-dev \
+            llvm-dev nasm ninja-build pkg-config wget
+
+      - name: Checkout source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          submodules: recursive
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch Flutter
+        shell: bash
+        run: |
+          flutter_root=$(dirname "$(dirname "$(which flutter)")")
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff "$flutter_root/"
+          cd "$flutter_root"
+          git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Install Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install Android native dependencies
+        shell: bash
+        run: |
+          if ! ./flutter/build_android_deps.sh "${{ matrix.abi }}"; then
+            find "$VCPKG_ROOT" -name '*.log' -print -exec cat {} \;
+            exit 1
+          fi
+
+      - name: Restore generated bridge
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          prefix-key: rustdesk-lib-cache-android
+          key: ${{ matrix.target }}
+
+      - name: Build Android native library
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo install cargo-ndk --version "$CARGO_NDK_VERSION" --locked
+          "./flutter/${{ matrix.build_script }}"
+          mkdir -p "android-native/${{ matrix.abi }}"
+          cp "target/${{ matrix.target }}/release/liblibrustdesk.so" "android-native/${{ matrix.abi }}/librustdesk.so"
+          cp "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${{ matrix.cxx_triple }}/libc++_shared.so" "android-native/${{ matrix.abi }}/"
+
+      - name: Upload Android native library
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: android-native-${{ matrix.target }}
+          path: android-native/${{ matrix.abi }}/
+          if-no-files-found: error
+
+  build-android-universal:
+    name: Build Android universal APK
+    needs:
+      - generate-bridge
+      - build-android-libraries
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          submodules: recursive
+
+      - name: Install Java
+        uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch Flutter
+        shell: bash
+        run: |
+          flutter_root=$(dirname "$(dirname "$(which flutter)")")
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff "$flutter_root/"
+          cd "$flutter_root"
+          git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Restore generated bridge
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Download Android arm64 library
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: android-native-aarch64-linux-android
+          path: flutter/android/app/src/main/jniLibs/arm64-v8a
+
+      - name: Download Android armv7 library
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: android-native-armv7-linux-androideabi
+          path: flutter/android/app/src/main/jniLibs/armeabi-v7a
+
+      - name: Download Android x86_64 library
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: android-native-x86_64-linux-android
+          path: flutter/android/app/src/main/jniLibs/x86_64
+
+      - name: Build installable universal APK
+        shell: bash
+        run: |
+          sed -i 's/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g' flutter/android/gradle.properties
+          sed -i 's/signingConfigs.release/signingConfigs.debug/g' flutter/android/app/build.gradle
+          pushd flutter
+          flutter build apk --release --target-platform android-arm64,android-arm,android-x64
+          popd
+          mkdir -p dist
+          mv flutter/build/app/outputs/flutter-apk/app-release.apk "dist/rustdesk-${VERSION}-android-universal.apk"
+          sha256sum "dist/rustdesk-${VERSION}-android-universal.apk" > dist/SHA256SUMS-android.txt
+
+      - name: Upload Android universal APK
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rustdesk-${{ env.VERSION }}-android-universal
+          path: dist/
+          if-no-files-found: error
