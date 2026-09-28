@@ -7,6 +7,14 @@ on:
         description: Run ID containing the Linux DEB artifact
         required: true
         default: "36365619249"
+      build_scope:
+        description: Components to build
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - appimage
 
 permissions:
   contents: read
@@ -24,10 +32,12 @@ env:
 
 jobs:
   generate-bridge:
+    if: inputs.build_scope == 'all'
     uses: ./.github/workflows/bridge.yml
 
   build-appimage:
     name: Build Linux x86_64 AppImage
+    if: inputs.build_scope == 'all' || inputs.build_scope == 'appimage'
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout source
@@ -60,7 +70,8 @@ jobs:
           mkdir -p dist
           appimage_path=$(find appimage -maxdepth 1 -type f -name '*.AppImage' -print -quit)
           test -n "$appimage_path"
-          mv "$appimage_path" "dist/rustdesk-${VERSION}-x86_64.AppImage"
+          sudo mv "$appimage_path" "dist/rustdesk-${VERSION}-x86_64.AppImage"
+          sudo chown "$(id -u):$(id -g)" "dist/rustdesk-${VERSION}-x86_64.AppImage"
           chmod +x "dist/rustdesk-${VERSION}-x86_64.AppImage"
           sha256sum "dist/rustdesk-${VERSION}-x86_64.AppImage" > dist/SHA256SUMS-appimage.txt
 
@@ -73,6 +84,7 @@ jobs:
 
   build-debian-arm64:
     name: Build Debian ARM64 client
+    if: inputs.build_scope == 'all'
     needs: generate-bridge
     runs-on: ubuntu-22.04-arm
     steps:
@@ -215,6 +227,7 @@ jobs:
 
   build-android-libraries:
     name: Build Android native library (${{ matrix.target }})
+    if: inputs.build_scope == 'all'
     needs: generate-bridge
     runs-on: ubuntu-24.04
     strategy:
@@ -343,6 +356,7 @@ jobs:
 
   build-android-universal:
     name: Build Android universal APK
+    if: inputs.build_scope == 'all'
     needs:
       - generate-bridge
       - build-android-libraries
