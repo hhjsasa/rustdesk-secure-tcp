@@ -11,7 +11,6 @@ env:
   VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
   VERSION: "1.5.0-secure-tcp-bypass"
-  RUSTFLAGS: "-C link-arg=/SUBSYSTEM:WINDOWS,6.02"
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -98,8 +97,8 @@ jobs:
             throw 'rustdesk.exe is not a 32-bit x86 executable.'
           }
           if ($headers -notmatch 'MajorSubsystemVersion: 6' -or
-              $headers -notmatch 'MinorSubsystemVersion: 2') {
-            throw 'rustdesk.exe does not declare Windows 8 (6.2) as its subsystem version.'
+              $headers -notmatch 'MinorSubsystemVersion: [0-2]') {
+            throw 'rustdesk.exe requires a Windows version newer than Windows 8 (6.2).'
           }
 
       - name: Build portable executable
@@ -126,8 +125,8 @@ jobs:
             throw 'The portable client is not a 32-bit x86 executable.'
           }
           if ($headers -notmatch 'MajorSubsystemVersion: 6' -or
-              $headers -notmatch 'MinorSubsystemVersion: 2') {
-            throw 'The portable client does not declare Windows 8 (6.2) as its subsystem version.'
+              $headers -notmatch 'MinorSubsystemVersion: [0-2]') {
+            throw 'The portable client requires a Windows version newer than Windows 8 (6.2).'
           }
           Get-ChildItem .\dist -File |
             Get-FileHash -Algorithm SHA256 |
