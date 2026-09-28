@@ -7,6 +7,10 @@ on:
         description: Run ID containing the Linux DEB artifact
         required: true
         default: "36365619249"
+      arm64_source_run_id:
+        description: Run ID containing the Debian ARM64 artifact
+        required: true
+        default: "36369266036"
       build_scope:
         description: Components to build
         required: true
@@ -15,6 +19,7 @@ on:
         options:
           - all
           - appimage
+          - appimage-arm64
 
 permissions:
   contents: read
@@ -79,6 +84,53 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: rustdesk-${{ env.VERSION }}-linux-x86_64-appimage
+          path: dist/
+          if-no-files-found: error
+
+  build-appimage-arm64:
+    name: Build Linux ARM64 AppImage
+    if: inputs.build_scope == 'all' || inputs.build_scope == 'appimage-arm64'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          submodules: recursive
+
+      - name: Download previously built Debian ARM64 package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: rustdesk-${{ env.VERSION }}-debian-arm64
+          path: linux-arm64-artifact
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.arm64_source_run_id }}
+
+      - name: Build ARM64 AppImage
+        shell: bash
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y libarchive-tools libfuse2
+          sudo pip3 install "setuptools_scm<10"
+          sudo pip3 install git+https://github.com/rustdesk-org/appimage-builder.git
+          cp "linux-arm64-artifact/rustdesk-${VERSION}-arm64.deb" appimage/rustdesk.deb
+          pushd appimage
+          ./build-apprun.sh aarch64
+          sudo appimage-builder --skip-tests --recipe ./AppImageBuilder-aarch64.yml
+          cmp AppDir/AppRun appimage-build/AppRun/v2.0.0/AppRun-Release-aarch64
+          popd
+          mkdir -p dist
+          appimage_path=$(find appimage -maxdepth 1 -type f -name '*.AppImage' -print -quit)
+          test -n "$appimage_path"
+          sudo mv "$appimage_path" "dist/rustdesk-${VERSION}-arm64.AppImage"
+          sudo chown "$(id -u):$(id -g)" "dist/rustdesk-${VERSION}-arm64.AppImage"
+          chmod +x "dist/rustdesk-${VERSION}-arm64.AppImage"
+          sha256sum "dist/rustdesk-${VERSION}-arm64.AppImage" > dist/SHA256SUMS-appimage-arm64.txt
+
+      - name: Upload ARM64 AppImage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rustdesk-${{ env.VERSION }}-linux-arm64-appimage
           path: dist/
           if-no-files-found: error
 
